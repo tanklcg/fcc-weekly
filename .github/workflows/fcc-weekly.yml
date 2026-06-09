@@ -1,0 +1,30 @@
+name: FCC Weekly Report
+
+on:
+  schedule:
+    - cron: "0 1 * * 5"   # 每週五 UTC 01:00（台灣時間週五早上 09:00）
+  workflow_dispatch:        # 允許手動觸發測試
+
+jobs:
+  send-weekly-report:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Install dependencies
+        run: npm install node-fetch nodemailer
+
+      - name: Send FCC weekly report
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          SMTP_USER: ${{ secrets.SMTP_USER }}
+          SMTP_PASSWORD: ${{ secrets.SMTP_PASSWORD }}
+          ALERT_EMAIL: tliao@netgear.com
+        run: node scripts/fcc-weekly.js
