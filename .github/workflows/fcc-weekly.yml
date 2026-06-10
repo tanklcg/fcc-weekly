@@ -18,7 +18,7 @@ jobs:
           node-version: "22"
 
       - name: Install dependencies
-        run: npm install node-fetch cheerio nodemailer
+        run: npm install node-fetch cheerio nodemailer pdfkit
 
       - name: Send FCC weekly report
         env:
