@@ -84,7 +84,7 @@ async function sendEmail(pdfBuffer) {
     auth: { user: process.env.SMTP_USER, pass: process.env.SMTP_PASSWORD },
   });
 
-  const today = new Date().toLocaleDateString("zh-TW", {
+  const today = new Date().toLocaleDateString("en-US", {
     year: "numeric", month: "long", day: "numeric", weekday: "long",
   });
   const filename = `FCC-Covered-List-${new Date().toISOString().slice(0, 10)}.pdf`;
@@ -92,8 +92,8 @@ async function sendEmail(pdfBuffer) {
   await transporter.sendMail({
     from: `"FCC Monitor" <${process.env.SMTP_USER}>`,
     to: ALERT_EMAIL,
-    subject: `[每週摘要] FCC 供應鏈 Covered List — ${today}`,
-    text: `請見附件 PDF：FCC 供應鏈 Covered List 本週完整內容。\n\n來源：${FCC_URL}\n擷取時間：${new Date().toLocaleString("zh-TW")}`,
+    subject: `[Weekly Report] FCC Supply Chain Covered List — ${today}`,
+    text: `Please find attached the weekly FCC Supply Chain Covered List report.\n\nSource: ${FCC_URL}\nGenerated: ${new Date().toLocaleString("en-US")}`,
     attachments: [{ filename, content: pdfBuffer, contentType: "application/pdf" }],
   });
 
