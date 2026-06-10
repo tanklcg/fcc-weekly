@@ -1,7 +1,6 @@
 #!/usr/bin/env node
 /**
- * FCC Covered List 每週摘要寄送（無需 Anthropic API）
- * 直接用 node-fetch 抓取網頁，擷取清單內容，透過 Gmail 寄出
+ * FCC Covered List 每週摘要 — 擷取核心內容並轉成 PDF 附件寄出
  *
  * 必要環境變數：
  *   SMTP_USER      - Gmail 地址
@@ -12,50 +11,148 @@
 import fetch from "node-fetch";
 import * as cheerio from "cheerio";
 import nodemailer from "nodemailer";
+import PDFDocument from "pdfkit";
+import { Buffer } from "buffer";
 
 const FCC_URL = "https://www.fcc.gov/supplychain/coveredlist";
 const ALERT_EMAIL = process.env.ALERT_EMAIL || "tliao@netgear.com";
+
+// ── 1. 擷取 FCC 頁面核心內容 ─────────────────────────────────────────────────
 
 async function fetchFCCContent() {
   console.log("正在擷取 FCC Covered List 頁面…");
 
   const res = await fetch(FCC_URL, {
-    headers: {
-      "User-Agent": "Mozilla/5.0 (compatible; FCC-Monitor/1.0)",
-    },
+    headers: { "User-Agent": "Mozilla/5.0 (compatible; FCC-Monitor/1.0)" },
   });
-
   if (!res.ok) throw new Error(`HTTP 錯誤：${res.status}`);
 
   const html = await res.text();
   const $ = cheerio.load(html);
 
-  let output = "";
+  // 移除導覽、頁首、頁尾等雜訊
+  $("nav, header, footer, script, style, .usa-nav, .usa-header, .usa-footer, .usa-banner").remove();
 
-  // 擷取頁面主要內容區塊
-  $("h2, h3, h4, p, li, td, th").each((_, el) => {
-    const text = $(el).text().trim();
-    if (text.length > 2) {
-      const tag = el.tagName.toLowerCase();
-      if (["h2", "h3", "h4"].includes(tag)) {
-        output += `\n${"─".repeat(50)}\n${text}\n${"─".repeat(50)}\n`;
-      } else if (tag === "li") {
-        output += `  • ${text}\n`;
-      } else if (tag === "th") {
-        output += `[${text}]  `;
-      } else if (tag === "td") {
-        output += `${text}  `;
-      } else {
-        output += `${text}\n`;
-      }
+  // 鎖定主要內容區
+  const main = $("main, #main-content, .main-content, article").first();
+  const root = main.length ? main : $("body");
+
+  const sections = [];
+
+  root.find("h1, h2, h3, h4, p, li, table").each((_, el) => {
+    const tag = el.tagName.toLowerCase();
+    const text = $(el).text().replace(/\s+/g, " ").trim();
+    if (!text || text.length < 3) return;
+
+    if (["h1","h2","h3","h4"].includes(tag)) {
+      sections.push({ type: "heading", level: tag, text });
+    } else if (tag === "p") {
+      sections.push({ type: "paragraph", text });
+    } else if (tag === "li") {
+      sections.push({ type: "bullet", text });
+    } else if (tag === "table") {
+      // 表格：逐行擷取
+      const rows = [];
+      $(el).find("tr").each((_, tr) => {
+        const cells = [];
+        $(tr).find("th, td").each((_, td) => {
+          cells.push($(td).text().replace(/\s+/g, " ").trim());
+        });
+        if (cells.some(c => c.length > 0)) rows.push(cells);
+      });
+      if (rows.length) sections.push({ type: "table", rows });
     }
   });
 
-  console.log(`擷取完成，共 ${output.length} 個字元。`);
-  return output.trim();
+  console.log(`擷取完成，共 ${sections.length} 個段落。`);
+  return sections;
 }
 
-async function sendEmail(content) {
+// ── 2. 產生 PDF ───────────────────────────────────────────────────────────────
+
+async function generatePDF(sections) {
+  return new Promise((resolve, reject) => {
+    const doc = new PDFDocument({ margin: 50, size: "A4" });
+    const chunks = [];
+
+    doc.on("data", chunk => chunks.push(chunk));
+    doc.on("end", () => resolve(Buffer.concat(chunks)));
+    doc.on("error", reject);
+
+    const today = new Date().toLocaleDateString("en-US", {
+      year: "numeric", month: "long", day: "numeric"
+    });
+
+    // 封面標題
+    doc.fontSize(18).font("Helvetica-Bold")
+      .text("FCC Supply Chain Covered List", { align: "center" });
+    doc.fontSize(11).font("Helvetica")
+      .text(`Weekly Report — ${today}`, { align: "center" });
+    doc.fontSize(9).fillColor("#666")
+      .text(`Source: ${FCC_URL}`, { align: "center" });
+    doc.moveDown(1.5);
+
+    // 分隔線
+    doc.moveTo(50, doc.y).lineTo(545, doc.y).strokeColor("#cccccc").stroke();
+    doc.moveDown(1);
+    doc.fillColor("#000000");
+
+    // 內容
+    for (const s of sections) {
+      if (doc.y > 750) doc.addPage();
+
+      if (s.type === "heading") {
+        const sizes = { h1: 16, h2: 14, h3: 12, h4: 11 };
+        const size = sizes[s.level] || 11;
+        doc.moveDown(0.5)
+          .fontSize(size).font("Helvetica-Bold")
+          .fillColor("#1a1a1a")
+          .text(s.text);
+        doc.font("Helvetica").fillColor("#000000");
+
+      } else if (s.type === "paragraph") {
+        doc.fontSize(9).font("Helvetica").fillColor("#333333")
+          .text(s.text, { align: "justify" });
+        doc.moveDown(0.3);
+
+      } else if (s.type === "bullet") {
+        doc.fontSize(9).font("Helvetica").fillColor("#333333")
+          .text(`• ${s.text}`, { indent: 15 });
+
+      } else if (s.type === "table") {
+        doc.moveDown(0.5);
+        const colWidth = Math.min(120, 490 / Math.max(s.rows[0]?.length || 1, 1));
+
+        s.rows.forEach((row, ri) => {
+          if (doc.y > 750) doc.addPage();
+          const isHeader = ri === 0;
+          doc.fontSize(8)
+            .font(isHeader ? "Helvetica-Bold" : "Helvetica")
+            .fillColor(isHeader ? "#1a1a1a" : "#333333");
+
+          let x = 50;
+          row.forEach(cell => {
+            doc.text(cell, x, doc.y, { width: colWidth - 4, lineBreak: false });
+            x += colWidth;
+          });
+          doc.moveDown(0.4);
+        });
+        doc.moveDown(0.3);
+      }
+    }
+
+    // 頁尾
+    doc.fontSize(8).fillColor("#999999")
+      .text(`Generated by FCC Monitor — ${new Date().toLocaleString("en-US")}`,
+        50, 790, { align: "center" });
+
+    doc.end();
+  });
+}
+
+// ── 3. 寄送 Email（PDF 附件）────────────────────────────────────────────────
+
+async function sendEmail(pdfBuffer) {
   const transporter = nodemailer.createTransport({
     service: "gmail",
     auth: {
@@ -67,39 +164,37 @@ async function sendEmail(content) {
   const today = new Date().toLocaleDateString("zh-TW", {
     year: "numeric", month: "long", day: "numeric", weekday: "long",
   });
-
-  const subject = `[每週摘要] FCC 供應鏈 Covered List — ${today}`;
-  const body = `以下為本週 FCC 供應鏈 Covered List 內容摘要。
-
-來源網址：${FCC_URL}
-擷取時間：${new Date().toLocaleString("zh-TW")}
-
-${"═".repeat(60)}
-
-${content}
-
-${"═".repeat(60)}
-此為每週五自動發送的摘要，由 GitHub Actions 排程執行。`;
+  const filename = `FCC-Covered-List-${new Date().toISOString().slice(0,10)}.pdf`;
 
   await transporter.sendMail({
     from: `"FCC Monitor" <${process.env.SMTP_USER}>`,
     to: ALERT_EMAIL,
-    subject,
-    text: body,
+    subject: `[每週摘要] FCC 供應鏈 Covered List — ${today}`,
+    text: `請見附件 PDF：FCC 供應鏈 Covered List 本週摘要。\n\n來源：${FCC_URL}\n擷取時間：${new Date().toLocaleString("zh-TW")}`,
+    attachments: [
+      {
+        filename,
+        content: pdfBuffer,
+        contentType: "application/pdf",
+      },
+    ],
   });
 
-  console.log(`信件已成功寄出至 ${ALERT_EMAIL}`);
+  console.log(`PDF 附件已成功寄出至 ${ALERT_EMAIL}（${filename}）`);
 }
+
+// ── 4. 主程式 ──────────────────────────────────────────────────────────────────
 
 async function main() {
   if (!process.env.SMTP_USER) throw new Error("未設定 SMTP_USER");
   if (!process.env.SMTP_PASSWORD) throw new Error("未設定 SMTP_PASSWORD");
 
-  const content = await fetchFCCContent();
-  await sendEmail(content);
+  const sections = await fetchFCCContent();
+  const pdfBuffer = await generatePDF(sections);
+  await sendEmail(pdfBuffer);
 }
 
-main().catch((err) => {
+main().catch(err => {
   console.error("執行失敗：", err.message);
   process.exit(1);
 });
