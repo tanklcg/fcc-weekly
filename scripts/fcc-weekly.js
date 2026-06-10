@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 /**
- * FCC Covered List 每週摘要 — 擷取核心內容並轉成 PDF 附件寄出
+ * FCC Covered List 每週摘要 — 用 Puppeteer 直接列印網頁為 PDF 寄出
  *
  * 必要環境變數：
  *   SMTP_USER      - Gmail 地址
@@ -8,149 +8,71 @@
  *   ALERT_EMAIL    - 收件者 email
  */
 
-import fetch from "node-fetch";
-import * as cheerio from "cheerio";
+import puppeteer from "puppeteer";
 import nodemailer from "nodemailer";
-import PDFDocument from "pdfkit";
-import { Buffer } from "buffer";
 
-const FCC_URL = "https://www.fcc.gov/supplychain/coveredlist";
+const FCC_URL = "https://www.fcc.gov/supplychain/coveredlist#conditional-approvals";
 const ALERT_EMAIL = process.env.ALERT_EMAIL || "tliao@netgear.com";
 
-// ── 1. 擷取 FCC 頁面核心內容 ─────────────────────────────────────────────────
+// ── 1. 用 Puppeteer 列印網頁為 PDF ────────────────────────────────────────────
 
-async function fetchFCCContent() {
-  console.log("正在擷取 FCC Covered List 頁面…");
+async function generatePDF() {
+  console.log("啟動瀏覽器，載入 FCC 頁面…");
 
-  const res = await fetch(FCC_URL, {
-    headers: { "User-Agent": "Mozilla/5.0 (compatible; FCC-Monitor/1.0)" },
-  });
-  if (!res.ok) throw new Error(`HTTP 錯誤：${res.status}`);
-
-  const html = await res.text();
-  const $ = cheerio.load(html);
-
-  // 移除導覽、頁首、頁尾等雜訊
-  $("nav, header, footer, script, style, .usa-nav, .usa-header, .usa-footer, .usa-banner").remove();
-
-  // 鎖定主要內容區
-  const main = $("main, #main-content, .main-content, article").first();
-  const root = main.length ? main : $("body");
-
-  const sections = [];
-
-  root.find("h1, h2, h3, h4, p, li, table").each((_, el) => {
-    const tag = el.tagName.toLowerCase();
-    const text = $(el).text().replace(/\s+/g, " ").trim();
-    if (!text || text.length < 3) return;
-
-    if (["h1","h2","h3","h4"].includes(tag)) {
-      sections.push({ type: "heading", level: tag, text });
-    } else if (tag === "p") {
-      sections.push({ type: "paragraph", text });
-    } else if (tag === "li") {
-      sections.push({ type: "bullet", text });
-    } else if (tag === "table") {
-      // 表格：逐行擷取
-      const rows = [];
-      $(el).find("tr").each((_, tr) => {
-        const cells = [];
-        $(tr).find("th, td").each((_, td) => {
-          cells.push($(td).text().replace(/\s+/g, " ").trim());
-        });
-        if (cells.some(c => c.length > 0)) rows.push(cells);
-      });
-      if (rows.length) sections.push({ type: "table", rows });
-    }
+  const browser = await puppeteer.launch({
+    args: ["--no-sandbox", "--disable-setuid-sandbox"],
+    headless: "new",
   });
 
-  console.log(`擷取完成，共 ${sections.length} 個段落。`);
-  return sections;
+  const page = await browser.newPage();
+  await page.setViewport({ width: 1280, height: 900 });
+
+  await page.goto(FCC_URL, {
+    waitUntil: "networkidle2",
+    timeout: 60000,
+  });
+
+  // 等待主要內容載入
+  await page.waitForSelector("table, main, #main-content", { timeout: 15000 }).catch(() => {});
+
+  // 隱藏導覽列、頁首頁尾，讓列印內容更乾淨
+  await page.addStyleTag({
+    content: `
+      header, nav, footer,
+      .usa-header, .usa-nav, .usa-footer,
+      .usa-banner, .usa-skipnav,
+      #header, #footer, #nav,
+      .site-header, .site-footer,
+      .breadcrumb, .usa-breadcrumb { display: none !important; }
+      body { font-size: 13px !important; }
+      main, #main-content { margin: 0 !important; padding: 10px !important; }
+      table { border-collapse: collapse !important; width: 100% !important; }
+      th, td { border: 1px solid #ccc !important; padding: 6px 8px !important; }
+      th { background-color: #f0f0f0 !important; font-weight: bold !important; }
+    `,
+  });
+
+  const pdfBuffer = await page.pdf({
+    format: "A4",
+    printBackground: true,
+    margin: { top: "15mm", bottom: "15mm", left: "12mm", right: "12mm" },
+    displayHeaderFooter: true,
+    headerTemplate: `
+      <div style="font-size:9px; width:100%; text-align:center; color:#555; padding:5px 0;">
+        FCC Supply Chain Covered List — Weekly Report
+      </div>`,
+    footerTemplate: `
+      <div style="font-size:9px; width:100%; text-align:center; color:#555; padding:5px 0;">
+        Source: ${FCC_URL} &nbsp;|&nbsp; <span class="date"></span> &nbsp;|&nbsp; Page <span class="pageNumber"></span> of <span class="totalPages"></span>
+      </div>`,
+  });
+
+  await browser.close();
+  console.log(`PDF 產生完成，大小：${(pdfBuffer.length / 1024).toFixed(1)} KB`);
+  return pdfBuffer;
 }
 
-// ── 2. 產生 PDF ───────────────────────────────────────────────────────────────
-
-async function generatePDF(sections) {
-  return new Promise((resolve, reject) => {
-    const doc = new PDFDocument({ margin: 50, size: "A4" });
-    const chunks = [];
-
-    doc.on("data", chunk => chunks.push(chunk));
-    doc.on("end", () => resolve(Buffer.concat(chunks)));
-    doc.on("error", reject);
-
-    const today = new Date().toLocaleDateString("en-US", {
-      year: "numeric", month: "long", day: "numeric"
-    });
-
-    // 封面標題
-    doc.fontSize(18).font("Helvetica-Bold")
-      .text("FCC Supply Chain Covered List", { align: "center" });
-    doc.fontSize(11).font("Helvetica")
-      .text(`Weekly Report — ${today}`, { align: "center" });
-    doc.fontSize(9).fillColor("#666")
-      .text(`Source: ${FCC_URL}`, { align: "center" });
-    doc.moveDown(1.5);
-
-    // 分隔線
-    doc.moveTo(50, doc.y).lineTo(545, doc.y).strokeColor("#cccccc").stroke();
-    doc.moveDown(1);
-    doc.fillColor("#000000");
-
-    // 內容
-    for (const s of sections) {
-      if (doc.y > 750) doc.addPage();
-
-      if (s.type === "heading") {
-        const sizes = { h1: 16, h2: 14, h3: 12, h4: 11 };
-        const size = sizes[s.level] || 11;
-        doc.moveDown(0.5)
-          .fontSize(size).font("Helvetica-Bold")
-          .fillColor("#1a1a1a")
-          .text(s.text);
-        doc.font("Helvetica").fillColor("#000000");
-
-      } else if (s.type === "paragraph") {
-        doc.fontSize(9).font("Helvetica").fillColor("#333333")
-          .text(s.text, { align: "justify" });
-        doc.moveDown(0.3);
-
-      } else if (s.type === "bullet") {
-        doc.fontSize(9).font("Helvetica").fillColor("#333333")
-          .text(`• ${s.text}`, { indent: 15 });
-
-      } else if (s.type === "table") {
-        doc.moveDown(0.5);
-        const colWidth = Math.min(120, 490 / Math.max(s.rows[0]?.length || 1, 1));
-
-        s.rows.forEach((row, ri) => {
-          if (doc.y > 750) doc.addPage();
-          const isHeader = ri === 0;
-          doc.fontSize(8)
-            .font(isHeader ? "Helvetica-Bold" : "Helvetica")
-            .fillColor(isHeader ? "#1a1a1a" : "#333333");
-
-          let x = 50;
-          row.forEach(cell => {
-            doc.text(cell, x, doc.y, { width: colWidth - 4, lineBreak: false });
-            x += colWidth;
-          });
-          doc.moveDown(0.4);
-        });
-        doc.moveDown(0.3);
-      }
-    }
-
-    // 頁尾
-    doc.fontSize(8).fillColor("#999999")
-      .text(`Generated by FCC Monitor — ${new Date().toLocaleString("en-US")}`,
-        50, 790, { align: "center" });
-
-    doc.end();
-  });
-}
-
-// ── 3. 寄送 Email（PDF 附件）────────────────────────────────────────────────
+// ── 2. 寄送 Email（PDF 附件）─────────────────────────────────────────────────
 
 async function sendEmail(pdfBuffer) {
   const transporter = nodemailer.createTransport({
@@ -164,13 +86,13 @@ async function sendEmail(pdfBuffer) {
   const today = new Date().toLocaleDateString("zh-TW", {
     year: "numeric", month: "long", day: "numeric", weekday: "long",
   });
-  const filename = `FCC-Covered-List-${new Date().toISOString().slice(0,10)}.pdf`;
+  const filename = `FCC-Covered-List-${new Date().toISOString().slice(0, 10)}.pdf`;
 
   await transporter.sendMail({
     from: `"FCC Monitor" <${process.env.SMTP_USER}>`,
     to: ALERT_EMAIL,
     subject: `[每週摘要] FCC 供應鏈 Covered List — ${today}`,
-    text: `請見附件 PDF：FCC 供應鏈 Covered List 本週摘要。\n\n來源：${FCC_URL}\n擷取時間：${new Date().toLocaleString("zh-TW")}`,
+    text: `請見附件 PDF：FCC 供應鏈 Covered List 本週完整內容。\n\n來源：${FCC_URL}\n擷取時間：${new Date().toLocaleString("zh-TW")}`,
     attachments: [
       {
         filename,
@@ -183,14 +105,13 @@ async function sendEmail(pdfBuffer) {
   console.log(`PDF 附件已成功寄出至 ${ALERT_EMAIL}（${filename}）`);
 }
 
-// ── 4. 主程式 ──────────────────────────────────────────────────────────────────
+// ── 3. 主程式 ─────────────────────────────────────────────────────────────────
 
 async function main() {
   if (!process.env.SMTP_USER) throw new Error("未設定 SMTP_USER");
   if (!process.env.SMTP_PASSWORD) throw new Error("未設定 SMTP_PASSWORD");
 
-  const sections = await fetchFCCContent();
-  const pdfBuffer = await generatePDF(sections);
+  const pdfBuffer = await generatePDF();
   await sendEmail(pdfBuffer);
 }
 
